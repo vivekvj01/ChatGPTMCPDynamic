@@ -39,6 +39,18 @@ type WidgetPlan = {
   assistant_text?: string;
 };
 
+type WidgetCacheEntry = {
+  expiresAt: number;
+  result: WidgetGenerationResult;
+};
+
+type WidgetGenerationCache = Map<string, WidgetCacheEntry>;
+
+type WidgetRecord = {
+  label: string;
+  url: string;
+};
+
 const VISUALIZE_SYSTEM_PROMPT = [
   "You choose the smallest correct visual guidance module set for a dynamic widget.",
   "Return JSON only.",
@@ -80,7 +92,7 @@ const REPAIR_SYSTEM_PROMPT = [
 ].join(" ");
 
 function buildVisualizeUserPrompt(input: WidgetGenerationInput): string {
-  const groundedText = String(input.groundedText || "").trim();
+  const groundedText = truncateForPrompt(String(input.groundedText || "").trim(), 2400);
 
   return [
     "Select widget design modules for this request.",
@@ -100,8 +112,8 @@ function buildVisualizeUserPrompt(input: WidgetGenerationInput): string {
 }
 
 function buildWidgetUserPrompt(input: WidgetGenerationInput, selectedModules: string[]): string {
-  const groundedText = String(input.groundedText || "").trim();
-  const citations = input.citations || [];
+  const groundedText = truncateForPrompt(String(input.groundedText || "").trim(), 4200);
+  const citations = (input.citations || []).slice(0, 8);
 
   return [
     `User query: ${input.query}`,
@@ -134,6 +146,24 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function normalizeWhitespace(value: string): string {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function truncateForPrompt(value: string, maxLength: number): string {
+  const normalized = String(value || "").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 function splitIntoSentences(text: string): string[] {
   return String(text || "")
     .split(/(?<=[.!?])\s+/)
@@ -152,6 +182,66 @@ function buildEvidenceItems(text: string): string[] {
     .map((part) => part.trim())
     .filter(Boolean)
     .slice(0, 4);
+}
+
+function extractMarkdownRecords(text: string): WidgetRecord[] {
+  const records: WidgetRecord[] = [];
+  const seen = new Set<string>();
+  const pattern = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = pattern.exec(text)) !== null && records.length < 8) {
+    const label = normalizeWhitespace(match[1]);
+    const url = normalizeWhitespace(match[2]);
+    const key = `${label}|${url}`.toLowerCase();
+    if (!label || !url || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    records.push({ label, url });
+  }
+
+  return records;
+}
+
+function replaceMarkdownLinksWithLabels(text: string): string {
+  return String(text || "").replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, "$1");
+}
+
+function normalizeGroundedNarrative(text: string): string {
+  return replaceMarkdownLinksWithLabels(
+    String(text || "")
+      .replace(/\|\s*/g, ", ")
+      .replace(/\n{3,}/g, "\n\n")
+  ).trim();
+}
+
+function buildNarrativeParagraphs(text: string): string[] {
+  const normalized = normalizeGroundedNarrative(text)
+    .split(/\n{2,}/)
+    .map((part) => normalizeWhitespace(part))
+    .filter(Boolean);
+
+  if (normalized.length > 0) {
+    return normalized.slice(0, 3);
+  }
+
+  return splitIntoSentences(text).slice(0, 3);
+}
+
+function buildStructuredEvidence(text: string): string[] {
+  const narrative = normalizeGroundedNarrative(text);
+  const sections = narrative
+    .split(/\n+/)
+    .map((part) => normalizeWhitespace(part))
+    .filter(Boolean)
+    .filter((part) => !/^https?:\/\//i.test(part));
+
+  if (sections.length > 0) {
+    return sections.slice(0, 5);
+  }
+
+  return buildEvidenceItems(text);
 }
 
 function inferFollowUpPrompt(query: string): string {
@@ -204,7 +294,13 @@ export function buildFinalWidgetHtml(input: WidgetGenerationInput): string {
     input.groundedText ||
       "The workspace is waiting for a grounded result. When one arrives, this artifact will reshape around the evidence."
   ).trim();
-  const evidenceItems = buildEvidenceItems(groundedText);
+  const narrativeParagraphs = buildNarrativeParagraphs(groundedText);
+  const evidenceItems = buildStructuredEvidence(groundedText);
+  const extractedRecords = extractMarkdownRecords(groundedText);
+  const explicitCitations = input.citations || [];
+  const topRecords = extractedRecords
+    .filter((record) => !explicitCitations.some((citation) => citation.url === record.url))
+    .slice(0, 6);
   const followUpPrompt = escapeHtml(inferFollowUpPrompt(query));
   return [
     "<style>",
@@ -216,26 +312,40 @@ export function buildFinalWidgetHtml(input: WidgetGenerationInput): string {
     ".eyebrow { font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; opacity: 0.72; margin-bottom: 12px; }",
     ".hero h1 { margin: 0 0 10px; font-family: var(--font-serif); font-size: 34px; font-weight: 400; letter-spacing: -0.03em; line-height: 0.98; }",
     ".hero p { margin: 0; font-size: 14px; color: rgba(255,255,255,0.82); }",
-    ".evidence-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 12px; }",
+    ".story-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 12px; }",
+    ".story-stack { display: grid; gap: 12px; }",
     ".panel { padding: 18px; border-radius: 20px; background: rgba(255,255,255,0.92); border: 1px solid rgba(148, 163, 184, 0.18); }",
     ".panel h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: -0.02em; }",
+    ".narrative { display: grid; gap: 10px; }",
+    ".narrative p { margin: 0; color: var(--color-text-secondary); line-height: 1.65; }",
     ".evidence-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }",
     ".evidence-list li { position: relative; padding-left: 18px; line-height: 1.55; color: var(--color-text-secondary); }",
     ".evidence-list li::before { content: ''; position: absolute; left: 0; top: 0.65em; width: 8px; height: 8px; border-radius: 999px; background: var(--color-accent-soft); box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.2); }",
     ".summary-card { display: grid; gap: 12px; align-content: start; }",
     ".summary-kicker { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--color-text-muted); }",
     ".summary-copy { margin: 0; font-size: 14px; line-height: 1.6; color: var(--color-text-secondary); }",
+    ".record-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }",
+    ".record-item { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; padding: 12px 14px; border-radius: 16px; background: rgba(248,250,252,0.92); border: 1px solid rgba(148,163,184,0.16); }",
+    ".record-label { font-weight: 600; color: var(--color-text); }",
+    ".record-link { color: var(--color-accent); text-decoration: none; font-weight: 600; }",
     ".action { margin-top: 6px; display: inline-flex; padding: 10px 14px; border-radius: 999px; background: #0f172a; color: #fff; text-decoration: none; font-weight: 600; border: 0; cursor: pointer; }",
     ".action.secondary { background: rgba(37, 99, 235, 0.08); color: var(--color-accent); }",
     ".citation-list { display: grid; gap: 8px; margin-top: 12px; }",
     ".citation { color: #1d4ed8; text-decoration: none; font-weight: 600; }",
-    "@media (max-width: 720px) { .evidence-grid { grid-template-columns: 1fr; } }",
+    "@media (max-width: 720px) { .story-grid { grid-template-columns: 1fr; } }",
     "</style>",
     `<div class="workspace">`,
-    `<section class="hero"><div class="eyebrow">Dynamic Run</div><h1>${label}</h1><p>${escapeHtml(groundedText)}</p></section>`,
-    `<section class="evidence-grid"><section class="panel"><h2>Evidence snapshot</h2><ul class="evidence-list">${evidenceItems
+    `<section class="hero"><div class="eyebrow">Dynamic Run</div><h1>${label}</h1><p>${escapeHtml(narrativeParagraphs[0] || normalizeWhitespace(groundedText))}</p></section>`,
+    `<section class="story-grid"><section class="story-stack"><section class="panel"><h2>Grounded narrative</h2><div class="narrative">${narrativeParagraphs
+      .map((item) => `<p>${escapeHtml(item)}</p>`)
+      .join("")}</div></section><section class="panel"><h2>Evidence snapshot</h2><ul class="evidence-list">${evidenceItems
       .map((item) => `<li>${escapeHtml(item)}</li>`)
-      .join("")}</ul></section><section class="panel summary-card"><div class="summary-kicker">Next move</div><p class="summary-copy">Keep exploring the grounded result, inspect supporting sources, or ask the model to dig deeper on one thread.</p><button class="action" onclick="sendPrompt('${followUpPrompt}')">Go deeper</button><button class="action secondary" onclick="sendPrompt('Summarize the strongest supporting evidence for this result.')">Summarize evidence</button></section></section>`,
+      .join("")}</ul></section>${topRecords.length > 0 ? `<section class="panel"><h2>Key records</h2><ul class="record-list">${topRecords
+        .map(
+          (record) =>
+            `<li class="record-item"><span class="record-label">${escapeHtml(record.label)}</span><a class="record-link" href="${escapeHtml(record.url)}" target="_blank" rel="noreferrer">Open record</a></li>`
+        )
+        .join("")}</ul></section>` : ""}</section><section class="panel summary-card"><div class="summary-kicker">Next move</div><p class="summary-copy">Keep exploring the grounded result, inspect supporting sources, or ask the model to dig deeper on one thread.</p><button class="action" onclick="sendPrompt('${followUpPrompt}')">Go deeper</button><button class="action secondary" onclick="sendPrompt('Summarize the strongest supporting evidence for this result.')">Summarize evidence</button></section></section>`,
     buildCitationList(input.citations),
     "</div>"
   ].join("");
@@ -367,35 +477,49 @@ async function callResponsesApi<T>(args: {
   schemaName: string;
   schema: Record<string, unknown>;
 }): Promise<T> {
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${args.config.openaiApiKey}`
-    },
-    body: JSON.stringify({
-      model: args.config.openaiWidgetModel,
-      input: [
-        { role: "system", content: args.system },
-        { role: "user", content: args.user }
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: args.schemaName,
-          strict: true,
-          schema: args.schema
-        }
+  const payload = JSON.stringify({
+    model: args.config.openaiWidgetModel,
+    input: [
+      { role: "system", content: args.system },
+      { role: "user", content: args.user }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: args.schemaName,
+        strict: true,
+        schema: args.schema
       }
-    })
+    }
   });
 
-  if (!response.ok) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${args.config.openaiApiKey}`
+      },
+      body: payload
+    });
+
+    if (response.ok) {
+      return parseStructuredResponse<T>(response, extractJson<T>);
+    }
+
     const text = await response.text().catch(() => "");
+    if (response.status === 429 && attempt < 2) {
+      const retryAfterHeader = Number(response.headers.get("retry-after") || "");
+      const retryAfterMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0 ? retryAfterHeader * 1000 : 0;
+      const backoffMs = retryAfterMs || (attempt + 1) * 1200;
+      await sleep(backoffMs);
+      continue;
+    }
+
     throw new Error(`OpenAI Responses API failed (${response.status})${text ? `: ${text}` : ""}`);
   }
 
-  return parseStructuredResponse<T>(response, extractJson<T>);
+  throw new Error("OpenAI Responses API exhausted retries.");
 }
 
 async function runOpenAiWidgetEngine(
@@ -574,7 +698,43 @@ function runDemoWidgetEngine(
 }
 
 export class WidgetEngine {
+  private readonly cache: WidgetGenerationCache = new Map();
+  private readonly inflight = new Map<string, Promise<WidgetGenerationResult>>();
+
   constructor(private readonly config: AppConfig) {}
+
+  private buildCacheKey(input: WidgetGenerationInput): string {
+    return JSON.stringify({
+      query: normalizeWhitespace(input.query),
+      groundedText: normalizeWhitespace(input.groundedText || ""),
+      citations: (input.citations || []).map((citation) => ({
+        label: normalizeWhitespace(citation.label),
+        url: normalizeWhitespace(citation.url)
+      })),
+      upstreamMode: input.upstreamMode || ""
+    });
+  }
+
+  private getCachedResult(cacheKey: string): WidgetGenerationResult | null {
+    const entry = this.cache.get(cacheKey);
+    if (!entry) {
+      return null;
+    }
+
+    if (entry.expiresAt < Date.now()) {
+      this.cache.delete(cacheKey);
+      return null;
+    }
+
+    return entry.result;
+  }
+
+  private setCachedResult(cacheKey: string, result: WidgetGenerationResult): void {
+    this.cache.set(cacheKey, {
+      expiresAt: Date.now() + 10 * 60 * 1000,
+      result
+    });
+  }
 
   hasOpenAiSupport(): boolean {
     return Boolean(String(this.config.openaiApiKey || "").trim());
@@ -585,17 +745,41 @@ export class WidgetEngine {
   }
 
   async generate(input: WidgetGenerationInput): Promise<WidgetGenerationResult> {
-    if (!this.hasOpenAiSupport()) {
-      return runDemoWidgetEngine(input);
+    const cacheKey = this.buildCacheKey(input);
+    const cached = this.getCachedResult(cacheKey);
+    if (cached) {
+      return cached;
     }
 
-    try {
-      return await runOpenAiWidgetEngine(this.config, input);
-    } catch (error) {
-      console.warn("[widget-engine] openai generation failed, falling back to demo", error);
-      return runDemoWidgetEngine(input, {
-        fallbackReason: buildFallbackReason(error)
-      });
+    const existingInflight = this.inflight.get(cacheKey);
+    if (existingInflight) {
+      return existingInflight;
     }
+
+    if (!this.hasOpenAiSupport()) {
+      const fallback = runDemoWidgetEngine(input);
+      this.setCachedResult(cacheKey, fallback);
+      return fallback;
+    }
+
+    const generationPromise = (async () => {
+      try {
+        const result = await runOpenAiWidgetEngine(this.config, input);
+        this.setCachedResult(cacheKey, result);
+        return result;
+      } catch (error) {
+        console.warn("[widget-engine] openai generation failed, falling back to demo", error);
+        const fallback = runDemoWidgetEngine(input, {
+          fallbackReason: buildFallbackReason(error)
+        });
+        this.setCachedResult(cacheKey, fallback);
+        return fallback;
+      } finally {
+        this.inflight.delete(cacheKey);
+      }
+    })();
+
+    this.inflight.set(cacheKey, generationPromise);
+    return generationPromise;
   }
 }
